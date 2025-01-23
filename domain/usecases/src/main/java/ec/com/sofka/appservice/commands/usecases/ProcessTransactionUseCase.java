@@ -3,18 +3,16 @@ package ec.com.sofka.appservice.commands.usecases;
 import ec.com.sofka.ConflictException;
 import ec.com.sofka.account.Account;
 import ec.com.sofka.aggregate.Customer;
+import ec.com.sofka.aggregate.events.AccountCreated;
+import ec.com.sofka.aggregate.events.EventsEnum;
 import ec.com.sofka.appservice.commands.CreateTransactionCommand;
 import ec.com.sofka.appservice.gateway.IBusEvent;
-import ec.com.sofka.appservice.gateway.dto.AccountDTO;
+import ec.com.sofka.appservice.gateway.IEventStore;
 import ec.com.sofka.appservice.mapper.Mapper;
-import ec.com.sofka.appservice.queries.query.GetByElementQuery;
 import ec.com.sofka.appservice.commands.UpdateAccountCommand;
 import ec.com.sofka.appservice.queries.query.GetByQuery;
 import ec.com.sofka.appservice.queries.responses.TransactionResponse;
 import ec.com.sofka.appservice.queries.usecases.GetAccountByAccountNumberUseCase;
-import ec.com.sofka.appservice.gateway.IEventStore;
-import ec.com.sofka.appservice.gateway.ITransactionRepository;
-import ec.com.sofka.appservice.gateway.dto.TransactionDTO;
 import ec.com.sofka.enums.OperationType;
 import ec.com.sofka.generics.domain.DomainEvent;
 import ec.com.sofka.strategy.process.CalculateFinalBalance;
@@ -53,70 +51,72 @@ public class ProcessTransactionUseCase {
 
     public Mono<TransactionResponse> apply(CreateTransactionCommand cmd, OperationType operationType) {
         GetByQuery accountNumberRequest = new GetByQuery(cmd.getAccountNumber());
+
+        Mono<AccountCreated> accountCreatedEvent = eventRepository.findAllAggregateByEvent(EventsEnum.ACCOUNT_CREATED.name())
+                .switchIfEmpty(Mono.empty())
+                .map(event -> (AccountCreated) event)
+                .filter(event -> event.getAccountNumber().equals(cmd.getAccountNumber()))
+                .single();
+
         return getAccountByNumberUseCase.get(accountNumberRequest)
                 .switchIfEmpty(Mono.error(new ConflictException("Account not found")))
-                .flatMap(queryResponse -> {
-                    return Mono.justOrEmpty(queryResponse.getSingleResult())
-                            .switchIfEmpty(Mono.error(new ConflictException("Account not found in query response.")))
-                            .flatMap(accountResponse -> {
-                                Account account = Mapper.accountResponseToAccount(accountResponse);
+                .flatMap(queryResponse -> Mono.justOrEmpty(queryResponse.getSingleResult())
+                        .switchIfEmpty(Mono.error(new ConflictException("Account not found in query response.")))
+                        .flatMap(accountResponse -> {
+                            Account account = Mapper.accountResponseToAccount(accountResponse);
+                            return accountCreatedEvent.flatMap(accountCreated -> {
+                                Flux<DomainEvent> eventsCustomer = eventRepository.findAggregate(accountCreated.getAggregateRootId());
 
-                                Customer customer = new Customer();
-                                return getTransactionStrategyUseCase.apply(account, cmd.getTransactionType(), operationType, cmd.getAmount())
-                                        .flatMap(strategy -> {
-                                            BigDecimal finalBalance = calculateFinalBalanceUseCase.apply(
-                                                    account.getBalance().getValue(),
-                                                    cmd.getAmount(),
-                                                    strategy.getAmount(),
-                                                    operationType
-                                            );
+                                return Customer.from(accountCreated.getAggregateRootId(), eventsCustomer)
+                                        .flatMap(customer -> getTransactionStrategyUseCase.apply(account, cmd.getTransactionType(), operationType, cmd.getAmount())
+                                                .flatMap(strategy -> {
+                                                    BigDecimal finalBalance = calculateFinalBalanceUseCase.apply(
+                                                            account.getBalance().getValue(),
+                                                            cmd.getAmount(),
+                                                            strategy.getAmount(),
+                                                            operationType
+                                                    );
 
-                                            if (isSaldoInsuficiente.test(finalBalance)) {
-                                                return Mono.error(new ConflictException("Insufficient balance for transaction."));
-                                            }
+                                                    if (isSaldoInsuficiente.test(finalBalance)) {
+                                                        return Mono.error(new ConflictException("Insufficient balance for transaction."));
+                                                    }
 
-                                            UpdateAccountCommand updateAccountRequest = new UpdateAccountCommand(
-                                                    cmd.getCustomerId(),
-                                                    finalBalance,
-                                                    account.getAccountNumber().getValue(),
-                                                    account.getOwner().getValue(),
-                                                    account.getStatus().getValue()
-                                            );
+                                                    UpdateAccountCommand updateAccountRequest = new UpdateAccountCommand(
+                                                            finalBalance,
+                                                            account.getAccountNumber().getValue(),
+                                                            account.getOwner().getValue(),
+                                                            account.getStatus().getValue()
+                                                    );
 
-                                            return updateAccountUseCase.execute(updateAccountRequest)
-                                                    .flatMap(updatedAccountResponse -> {
-                                                        customer.createTransaction(
-                                                                cmd.getAmount(),
-                                                                strategy.getAmount(),
-                                                                LocalDateTime.now(),
-                                                                cmd.getTransactionType(),
-                                                                updatedAccountResponse.getAccountId()
-                                                        );
+                                                    return updateAccountUseCase.execute(updateAccountRequest)
+                                                            .flatMap(updatedAccountResponse -> {
+                                                                customer.createTransaction(
+                                                                        cmd.getAmount(),
+                                                                        strategy.getAmount(),
+                                                                        LocalDateTime.now(),
+                                                                        cmd.getTransactionType(),
+                                                                        updatedAccountResponse.getAccountId()
+                                                                );
 
-                                                        return Flux.fromIterable(customer.getUncommittedEvents())
-                                                                .flatMap(event -> {
-                                                                    // Guardar el evento
-                                                                    return eventRepository.save(event)
-                                                                            // Enviar el evento por BusEvent
-                                                                            .doOnNext(savedEvent ->
-                                                                                    busEvent.sendEventTransactionCreated(Mono.just(savedEvent)));
-                                                                })
-                                                                .then(Mono.just(customer.getUncommittedEvents()));
-                                                    })
-                                                    .map(uncommittedEvents -> {
-                                                        customer.markEventsAsCommitted();
-                                                        return new TransactionResponse(
-                                                                customer.getId().getValue(),
-                                                                cmd.getCustomerId(),
-                                                                cmd.getAccountNumber(),
-                                                                strategy.getAmount(),
-                                                                cmd.getAmount(),
-                                                                LocalDateTime.now(),
-                                                                cmd.getTransactionType()
-                                                        );
-                                                    });
-                                        });
+                                                                return Flux.fromIterable(customer.getUncommittedEvents())
+                                                                        .flatMap(event -> eventRepository.save(event)
+                                                                                .doOnNext(savedEvent -> busEvent.sendEventTransactionCreated(Mono.just(savedEvent))))
+                                                                        .then(Mono.just(customer.getUncommittedEvents()));
+                                                            })
+                                                            .map(uncommittedEvents -> {
+                                                                customer.markEventsAsCommitted();
+                                                                return new TransactionResponse(
+                                                                        customer.getId().getValue(),
+                                                                        cmd.getAccountNumber(),
+                                                                        strategy.getAmount(),
+                                                                        cmd.getAmount(),
+                                                                        LocalDateTime.now(),
+                                                                        cmd.getTransactionType()
+                                                                );
+                                                            });
+                                                }));
                             });
-                });
+                        })
+                );
     }
 }
